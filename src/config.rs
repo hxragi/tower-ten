@@ -2,6 +2,7 @@ use std::{fmt, time::Duration};
 
 use crate::state::AdaptiveLimit;
 
+// Configuration [`AdaptiveLimit`](crate::AdaptiveLimit)
 #[derive(Debug, Clone)]
 pub struct AdaptiveLimitConfig {
     pub(crate) min_limit: usize,
@@ -32,64 +33,75 @@ impl Default for AdaptiveLimitConfig {
 }
 
 impl AdaptiveLimitConfig {
+    // Default values
     pub fn new() -> Self {
         Self::default()
     }
 
+    // Default is `2`
     #[must_use]
     pub fn with_min_limit(mut self, min_limit: usize) -> Self {
         self.min_limit = min_limit;
         self
     }
 
+    // Default is `1024`
     #[must_use]
     pub fn with_max_limit(mut self, max_limit: usize) -> Self {
         self.max_limit = max_limit;
         self
     }
 
+    // Default `16`
     #[must_use]
     pub fn with_initial_limit(mut self, initial_limit: usize) -> Self {
         self.initial_limit = initial_limit;
         self
     }
 
+    // Default `4`
     #[must_use]
     pub fn with_headroom(mut self, headroom: usize) -> Self {
         self.headroom = headroom;
         self
     }
 
+    // Default `10 min`
     #[must_use]
     pub fn with_min_rtt_window(mut self, window: Duration) -> Self {
         self.min_rtt_window = window;
         self
     }
 
+    // Default `0.2`
     #[must_use]
     pub fn with_ewma_alpha(mut self, alpha: f64) -> Self {
         self.ewma_alpha = alpha;
         self
     }
 
+    // Default `32`
     #[must_use]
     pub fn with_adapt_batch_usize(mut self, batch: usize) -> Self {
         self.adapt_batch_size = batch;
         self
     }
 
+    // Default `0.25`
     #[must_use]
     pub fn with_max_rampup_fraction(mut self, fraction: f64) -> Self {
         self.max_rampup_fraction = fraction;
         self
     }
 
+    // Default `0.8`
     #[must_use]
     pub fn with_error_decrease_factor(mut self, factor: f64) -> Self {
         self.error_decrease_factor = factor;
         self
     }
 
+    // Check configuration and create [`AdaptiveLimit`]
     pub fn build(self) -> Result<AdaptiveLimit, ConfigError> {
         AdaptiveLimit::new(self)
     }
@@ -132,6 +144,7 @@ impl AdaptiveLimitConfig {
     }
 }
 
+// Configuration error
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum ConfigError {

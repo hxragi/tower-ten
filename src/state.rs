@@ -1,15 +1,19 @@
 use std::{
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, AtomicUsize},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use crate::config::{AdaptiveLimitConfig, ConfigError};
+use crate::{
+    config::{AdaptiveLimitConfig, ConfigError},
+    permit::Permit,
+};
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
+#[inline]
 pub(crate) fn mono_now_ns() -> u64 {
     let elapsed = PROCESS_START.get_or_init(Instant::now).elapsed();
     elapsed.as_nanos() as u64
@@ -39,6 +43,30 @@ impl AdaptiveLimit {
         Ok(Self {
             shared: Arc::new(Shared::new(config)),
         })
+    }
+
+    pub fn try_acquire_permit(&self) -> Option<Permit> {
+        if self.shared.try_acquire() {
+            Some(Permit::new(Arc::clone(&self.shared)))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.shared
+    }
+
+    pub fn current_limit(&self) -> usize {
+        self.shared.limit.load(Ordering::Relaxed)
+    }
+
+    pub fn active_requests(&self) -> usize {
+        self.shared.active.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> AdaptiveLimitSnapshot {
+        self.shared.snapshot()
     }
 }
 
@@ -86,6 +114,176 @@ impl Shared {
             total_rejected: AtomicU64::new(0),
             total_adaptations: AtomicU64::new(0),
         }
+    }
+
+    #[inline]
+    pub(crate) fn try_acquire(&self) -> bool {
+        loop {
+            let current = self.active.load(Ordering::Acquire);
+            if current >= self.limit.load(Ordering::Acquire) {
+                self.total_rejected.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            if self
+                .active
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    pub(crate) fn complete(&self, rtt_ns: u64, success: bool) {
+        self.active.fetch_sub(1, Ordering::Release);
+        let rtt_ns = rtt_ns.max(1);
+        self.observe_rtt(rtt_ns);
+        self.epoch_rtt_min.fetch_min(rtt_ns, Ordering::Relaxed);
+
+        self.total_completed.fetch_add(1, Ordering::Relaxed);
+        if !success {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+            self.total_errors.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let completed = self.completed.fetch_add(1, Ordering::AcqRel) + 1;
+        if completed >= self.cfg.adapt_batch_size {
+            self.maybe_adapt();
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.active.fetch_sub(1, Ordering::Release);
+        self.total_dropped.fetch_add(1, Ordering::Relaxed);
+
+        let dropped = self.dropped.fetch_add(1, Ordering::AcqRel) + 1;
+        if dropped >= self.cfg.adapt_batch_size {
+            self.maybe_adapt();
+        }
+    }
+
+    #[inline]
+    fn observe_rtt(&self, rtt_ns: u64) {
+        let now = mono_now_ns();
+        let window_start = self.window_start_ns.load(Ordering::Relaxed);
+
+        if now.saturating_sub(window_start) >= self.min_rtt_window_ns
+            || self.rtt_min.load(Ordering::Relaxed) == 0
+        {
+            self.rtt_min.store(rtt_ns, Ordering::Relaxed);
+            self.window_start_ns.store(now, Ordering::Relaxed);
+            return;
+        }
+
+        let mut current = self.rtt_min.load(Ordering::Relaxed);
+        while rtt_ns < current {
+            match self.rtt_min.compare_exchange_weak(
+                current,
+                rtt_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(()) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn maybe_adapt(&self) {
+        if self.completed.load(Ordering::Relaxed) + self.dropped.load(Ordering::Relaxed)
+            < self.cfg.adapt_batch_size
+        {
+            return;
+        }
+
+        if self
+            .adapting
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let completed = self.completed.swap(0, Ordering::Relaxed);
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        let errors = self.errors.swap(0, Ordering::Relaxed);
+        let epoch_rtt_min = self.epoch_rtt_min.swap(u64::MAX, Ordering::Relaxed);
+
+        if completed + dropped >= self.cfg.adapt_batch_size {
+            self.adapt(dropped, errors, epoch_rtt_min);
+        } else {
+            self.completed.fetch_add(completed, Ordering::Relaxed);
+            self.dropped.fetch_add(dropped, Ordering::Relaxed);
+            self.errors.fetch_add(errors, Ordering::Relaxed);
+            if epoch_rtt_min != u64::MAX {
+                self.epoch_rtt_min
+                    .fetch_min(epoch_rtt_min, Ordering::Relaxed);
+            }
+        }
+
+        self.adapting.store(0, Ordering::Release);
+    }
+
+    fn adapt(&self, dropped: usize, errors: usize, epoch_rtt_min: u64) {
+        let limit = self.limit.load(Ordering::Relaxed) as f64;
+        let mut new_limit = limit;
+
+        if epoch_rtt_min != u64::MAX {
+            let prev_ewma = self.rtt_ewma.load(Ordering::Relaxed);
+            let ewma = if prev_ewma == 0 {
+                epoch_rtt_min
+            } else {
+                let alpha = self.cfg.ewma_alpha;
+                (prev_ewma as f64 * (1.0 - alpha) + epoch_rtt_min as f64 * alpha) as u64
+            };
+            self.rtt_ewma.store(ewma, Ordering::Relaxed);
+
+            let rtt_min = self.rtt_min.load(Ordering::Relaxed);
+            if ewma > 0 {
+                let gradient = (rtt_min as f64 / ewma as f64).clamp(0.0, 1.0);
+                new_limit = limit * gradient + self.cfg.headroom as f64;
+            }
+        }
+
+        if errors > 0 {
+            let decreased = limit * self.cfg.error_decrease_factor;
+            new_limit = new_limit.min(decreased);
+        }
+
+        if dropped > 0 {
+            new_limit = new_limit.min(limit);
+        }
+
+        if new_limit > limit {
+            let capped = (limit * (1.0 + self.cfg.max_rampup_fraction)).max(limit + 1.0);
+            new_limit = new_limit.min(capped);
+        }
+
+        let new_limit = (new_limit.round() as usize).clamp(self.cfg.min_limit, self.cfg.max_limit);
+        self.limit.store(new_limit, Ordering::Relaxed);
+        self.total_adaptations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> AdaptiveLimitSnapshot {
+        AdaptiveLimitSnapshot {
+            current_limit: self.limit.load(Ordering::Relaxed),
+            active_requests: self.active.load(Ordering::Relaxed),
+            min_rtt: nz_duration(self.rtt_min.load(Ordering::Relaxed)),
+            ewma_rtt: nz_duration(self.rtt_ewma.load(Ordering::Relaxed)),
+            total_completed: self.total_completed.load(Ordering::Relaxed),
+            total_errors: self.total_errors.load(Ordering::Relaxed),
+            total_dropped: self.total_dropped.load(Ordering::Relaxed),
+            total_rejected: self.total_rejected.load(Ordering::Relaxed),
+            total_adptations: self.total_adaptations.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn nz_duration(ns: u64) -> Option<Duration> {
+    if ns == 0 {
+        None
+    } else {
+        Some(Duration::from_nanos(ns))
     }
 }
 
