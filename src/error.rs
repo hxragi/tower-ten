@@ -2,7 +2,7 @@ use std::{error, fmt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdaptiveLimitError<E> {
-    // Limit concurrency exceeded - request decline without waiting
+    // Limit concurrency exceeded - request rejected without waiting
     LimitExceeded,
     // Inner service returned error
     Inner(E),
