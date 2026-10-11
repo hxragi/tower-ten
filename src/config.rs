@@ -185,13 +185,311 @@ mod tests {
 
     #[test]
     fn default_config_is_valid() {
+        assert!(AdaptiveLimitConfig::default().build().is_ok());
+        assert!(AdaptiveLimitConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn default_field_values() {
+        let cfg = AdaptiveLimitConfig::default();
+        assert_eq!(cfg.min_limit, 2);
+        assert_eq!(cfg.max_limit, 1024);
+        assert_eq!(cfg.initial_limit, 16);
+        assert_eq!(cfg.headroom, 4);
+        assert_eq!(cfg.min_rtt_window, Duration::from_secs(600));
+        assert_eq!(cfg.ewma_alpha, 0.2);
+        assert_eq!(cfg.adapt_batch_size, 32);
+        assert_eq!(cfg.max_rampup_fraction, 0.25);
+        assert_eq!(cfg.error_decrease_factor, 0.8);
+    }
+
+    #[test]
+    fn new_is_equivalent_to_default() {
+        let cfg = AdaptiveLimitConfig::new();
+        assert_eq!(cfg.min_limit, AdaptiveLimitConfig::default().min_limit);
+        assert_eq!(cfg.max_limit, AdaptiveLimitConfig::default().max_limit);
+        assert_eq!(
+            cfg.initial_limit,
+            AdaptiveLimitConfig::default().initial_limit
+        );
+        assert_eq!(cfg.headroom, AdaptiveLimitConfig::default().headroom);
+        assert_eq!(
+            cfg.min_rtt_window,
+            AdaptiveLimitConfig::default().min_rtt_window
+        );
+        assert_eq!(cfg.ewma_alpha, AdaptiveLimitConfig::default().ewma_alpha);
+        assert_eq!(
+            cfg.adapt_batch_size,
+            AdaptiveLimitConfig::default().adapt_batch_size
+        );
+        assert_eq!(
+            cfg.max_rampup_fraction,
+            AdaptiveLimitConfig::default().max_rampup_fraction
+        );
+        assert_eq!(
+            cfg.error_decrease_factor,
+            AdaptiveLimitConfig::default().error_decrease_factor
+        );
+    }
+
+    #[test]
+    fn builders_override_each_field() {
+        let window = Duration::from_millis(750);
+        let cfg = AdaptiveLimitConfig::new()
+            .with_min_limit(5)
+            .with_max_limit(500)
+            .with_initial_limit(50)
+            .with_headroom(9)
+            .with_min_rtt_window(window)
+            .with_ewma_alpha(0.75)
+            .with_adapt_batch_usize(7)
+            .with_max_rampup_fraction(0.5)
+            .with_error_decrease_factor(0.25);
+
+        assert_eq!(cfg.min_limit, 5);
+        assert_eq!(cfg.max_limit, 500);
+        assert_eq!(cfg.initial_limit, 50);
+        assert_eq!(cfg.headroom, 9);
+        assert_eq!(cfg.min_rtt_window, window);
+        assert_eq!(cfg.ewma_alpha, 0.75);
+        assert_eq!(cfg.adapt_batch_size, 7);
+        assert_eq!(cfg.max_rampup_fraction, 0.5);
+        assert_eq!(cfg.error_decrease_factor, 0.25);
+    }
+
+    #[test]
+    fn builders_consume_and_return_self() {
+        let base = AdaptiveLimitConfig::new().with_min_limit(3);
+        let derived = base.clone().with_min_limit(4);
+        assert_eq!(base.min_limit, 3);
+        assert_eq!(derived.min_limit, 4);
+    }
+
+    #[test]
+    fn accepts_boundary_values() {
+        assert!(
+            AdaptiveLimitConfig::new()
+                .with_min_limit(1)
+                .with_max_limit(1)
+                .with_initial_limit(1)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            AdaptiveLimitConfig::new()
+                .with_min_limit(3)
+                .with_max_limit(3)
+                .with_initial_limit(3)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            AdaptiveLimitConfig::new()
+                .with_ewma_alpha(1.0)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            AdaptiveLimitConfig::new()
+                .with_ewma_alpha(f64::MIN_POSITIVE)
+                .validate()
+                .is_ok()
+        );
+        for fraction in [0.0, 1.0] {
+            assert!(
+                AdaptiveLimitConfig::new()
+                    .with_max_rampup_fraction(fraction)
+                    .validate()
+                    .is_ok()
+            );
+        }
+        for factor in [f64::MIN_POSITIVE, 1.0 - f64::EPSILON] {
+            assert!(
+                AdaptiveLimitConfig::new()
+                    .with_error_decrease_factor(factor)
+                    .validate()
+                    .is_ok()
+            );
+        }
+        assert!(
+            AdaptiveLimitConfig::new()
+                .with_adapt_batch_usize(1)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            AdaptiveLimitConfig::new()
+                .with_min_rtt_window(Duration::from_nanos(1))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            AdaptiveLimitConfig::new()
+                .with_headroom(0)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_alpha_bounds() {
+        for alpha in [-f64::MIN_POSITIVE, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = AdaptiveLimitConfig::default()
+                .with_ewma_alpha(alpha)
+                .build()
+                .unwrap_err();
+            assert!(matches!(err, ConfigError::InvalidEwmaAlpha(_)));
+        }
+    }
+
+    #[test]
+    fn validation_reports_first_failing_rule() {
         assert_eq!(
             AdaptiveLimitConfig::default()
+                .with_min_limit(0)
+                .with_max_limit(0)
+                .with_ewma_alpha(-1.0)
                 .build()
-                .unwrap()
-                .current_limit(),
-            16
+                .unwrap_err(),
+            ConfigError::MinLimitIsZero
         );
+        assert_eq!(
+            AdaptiveLimitConfig::default()
+                .with_min_limit(10)
+                .with_max_limit(5)
+                .with_ewma_alpha(-1.0)
+                .build()
+                .unwrap_err(),
+            ConfigError::MaxBelowMin { min: 10, max: 5 }
+        );
+        assert_eq!(
+            AdaptiveLimitConfig::default()
+                .with_initial_limit(1)
+                .with_ewma_alpha(-1.0)
+                .build()
+                .unwrap_err(),
+            ConfigError::InitialLimitOutOfRange {
+                initial: 1,
+                min: 2,
+                max: 1024,
+            }
+        );
+        assert_eq!(
+            AdaptiveLimitConfig::default()
+                .with_ewma_alpha(-1.0)
+                .with_max_rampup_fraction(-1.0)
+                .build()
+                .unwrap_err(),
+            ConfigError::InvalidEwmaAlpha(-1.0)
+        );
+        assert_eq!(
+            AdaptiveLimitConfig::default()
+                .with_max_rampup_fraction(-1.0)
+                .with_error_decrease_factor(-1.0)
+                .build()
+                .unwrap_err(),
+            ConfigError::InvalidRampupFraction(-1.0)
+        );
+        assert_eq!(
+            AdaptiveLimitConfig::default()
+                .with_error_decrease_factor(-1.0)
+                .with_adapt_batch_usize(0)
+                .build()
+                .unwrap_err(),
+            ConfigError::InvalidErrorDecreaseFactor(-1.0)
+        );
+        assert_eq!(
+            AdaptiveLimitConfig::default()
+                .with_adapt_batch_usize(0)
+                .with_min_rtt_window(Duration::ZERO)
+                .build()
+                .unwrap_err(),
+            ConfigError::ZeroAdaptBatchSize
+        );
+    }
+
+    #[test]
+    fn display_messages() {
+        assert_eq!(
+            ConfigError::MinLimitIsZero.to_string(),
+            "min_limit must be >= 1"
+        );
+        assert_eq!(
+            ConfigError::MaxBelowMin { min: 10, max: 5 }.to_string(),
+            "max_limit (5) must be >= min_limit (10)"
+        );
+        assert_eq!(
+            ConfigError::InitialLimitOutOfRange {
+                initial: 1,
+                min: 2,
+                max: 1024,
+            }
+            .to_string(),
+            "initial_limit (1) must be within [2, 1024]"
+        );
+        assert_eq!(
+            ConfigError::InvalidEwmaAlpha(0.5).to_string(),
+            "ewma_alpha must be in (0, 1], got 0.5"
+        );
+        assert_eq!(
+            ConfigError::InvalidRampupFraction(1.5).to_string(),
+            "max_rampup_fraction must be in [0, 1], got 1.5"
+        );
+        assert_eq!(
+            ConfigError::InvalidErrorDecreaseFactor(1.5).to_string(),
+            "error_decrease_factor must be in (0, 1), got 1.5"
+        );
+        assert_eq!(
+            ConfigError::ZeroAdaptBatchSize.to_string(),
+            "adapt_batch_size must be >= 1"
+        );
+        assert_eq!(
+            ConfigError::ZeroMinRttWindow.to_string(),
+            "min_rtt_window must be > 0"
+        );
+    }
+
+    #[test]
+    fn config_error_derives_debug_clone_and_partial_eq() {
+        let err = AdaptiveLimitConfig::default()
+            .with_max_limit(5)
+            .with_min_limit(10)
+            .build()
+            .unwrap_err();
+
+        assert_eq!(err.clone(), err);
+        assert_ne!(err, ConfigError::MinLimitIsZero);
+        assert!(format!("{err:?}").contains("MaxBelowMin"));
+    }
+
+    #[test]
+    fn config_error_is_std_error_without_source() {
+        use std::error::Error as _;
+
+        let err = AdaptiveLimitConfig::default()
+            .with_min_limit(0)
+            .build()
+            .unwrap_err();
+        assert!(err.source().is_none());
+        assert!(format!("{err:?}").contains("MinLimitIsZero"));
+
+        let boxed: Box<dyn std::error::Error> = Box::new(err);
+        assert_eq!(boxed.to_string(), "min_limit must be >= 1");
+    }
+
+    #[test]
+    fn rejects_zero_batch_and_window() {
+        let err = AdaptiveLimitConfig::default()
+            .with_adapt_batch_usize(0)
+            .build()
+            .unwrap_err();
+        assert_eq!(err, ConfigError::ZeroAdaptBatchSize);
+
+        let err = AdaptiveLimitConfig::default()
+            .with_min_rtt_window(Duration::ZERO)
+            .build()
+            .unwrap_err();
+        assert_eq!(err, ConfigError::ZeroMinRttWindow);
     }
 
     #[test]
@@ -258,20 +556,5 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, ConfigError::InvalidErrorDecreaseFactor(_)));
         }
-    }
-
-    #[test]
-    fn rejects_zero_batch_and_window() {
-        let err = AdaptiveLimitConfig::default()
-            .with_adapt_batch_size(0)
-            .build()
-            .unwrap_err();
-        assert_eq!(err, ConfigError::ZeroAdaptBatchSize);
-
-        let err = AdaptiveLimitConfig::default()
-            .with_min_rtt_window(Duration::ZERO)
-            .build()
-            .unwrap_err();
-        assert_eq!(err, ConfigError::ZeroMinRttWindow);
     }
 }

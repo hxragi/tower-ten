@@ -1,3 +1,3 @@
-mod error;
 mod config;
+mod error;
 mod state;
