@@ -2,7 +2,6 @@ use std::{fmt, time::Duration};
 
 use crate::state::AdaptiveLimit;
 
-// Configuration [`AdaptiveLimit`](crate::AdaptiveLimit)
 #[derive(Debug, Clone)]
 pub struct AdaptiveLimitConfig {
     pub(crate) min_limit: usize,
@@ -33,75 +32,65 @@ impl Default for AdaptiveLimitConfig {
 }
 
 impl AdaptiveLimitConfig {
-    // Default values
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    // Default is `2`
     #[must_use]
     pub fn with_min_limit(mut self, min_limit: usize) -> Self {
         self.min_limit = min_limit;
         self
     }
 
-    // Default is `1024`
     #[must_use]
     pub fn with_max_limit(mut self, max_limit: usize) -> Self {
         self.max_limit = max_limit;
         self
     }
 
-    // Default `16`
     #[must_use]
     pub fn with_initial_limit(mut self, initial_limit: usize) -> Self {
         self.initial_limit = initial_limit;
         self
     }
 
-    // Default `4`
     #[must_use]
     pub fn with_headroom(mut self, headroom: usize) -> Self {
         self.headroom = headroom;
         self
     }
 
-    // Default `10 min`
     #[must_use]
     pub fn with_min_rtt_window(mut self, window: Duration) -> Self {
         self.min_rtt_window = window;
         self
     }
 
-    // Default `0.2`
     #[must_use]
     pub fn with_ewma_alpha(mut self, alpha: f64) -> Self {
         self.ewma_alpha = alpha;
         self
     }
 
-    // Default `32`
     #[must_use]
-    pub fn with_adapt_batch_usize(mut self, batch: usize) -> Self {
+    pub fn with_adapt_batch_size(mut self, batch: usize) -> Self {
         self.adapt_batch_size = batch;
         self
     }
 
-    // Default `0.25`
     #[must_use]
     pub fn with_max_rampup_fraction(mut self, fraction: f64) -> Self {
         self.max_rampup_fraction = fraction;
         self
     }
 
-    // Default `0.8`
     #[must_use]
     pub fn with_error_decrease_factor(mut self, factor: f64) -> Self {
         self.error_decrease_factor = factor;
         self
     }
 
-    // Check configuration and create [`AdaptiveLimit`]
     pub fn build(self) -> Result<AdaptiveLimit, ConfigError> {
         AdaptiveLimit::new(self)
     }
@@ -144,7 +133,6 @@ impl AdaptiveLimitConfig {
     }
 }
 
-// Configuration error
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum ConfigError {
@@ -175,9 +163,7 @@ impl fmt::Display for ConfigError {
             Self::InitialLimitOutOfRange { initial, min, max } => {
                 write!(f, "initial_limit ({initial}) must be within [{min}, {max}]")
             }
-            Self::InvalidEwmaAlpha(a) => {
-                write!(f, "ewma_alpha must be in (0, 1], got {a}")
-            }
+            Self::InvalidEwmaAlpha(a) => write!(f, "ewma_alpha must be in (0, 1], got {a}"),
             Self::InvalidRampupFraction(x) => {
                 write!(f, "max_rampup_fraction must be in [0, 1], got {x}")
             }
@@ -255,7 +241,7 @@ mod tests {
             .with_headroom(9)
             .with_min_rtt_window(window)
             .with_ewma_alpha(0.75)
-            .with_adapt_batch_usize(7)
+            .with_adapt_batch_size(7)
             .with_max_rampup_fraction(0.5)
             .with_error_decrease_factor(0.25);
 
@@ -296,19 +282,15 @@ mod tests {
                 .validate()
                 .is_ok()
         );
-        assert!(
-            AdaptiveLimitConfig::new()
-                .with_ewma_alpha(1.0)
-                .validate()
-                .is_ok()
-        );
-        assert!(
-            AdaptiveLimitConfig::new()
-                .with_ewma_alpha(f64::MIN_POSITIVE)
-                .validate()
-                .is_ok()
-        );
-        for fraction in [0.0, 1.0] {
+        for alpha in [f64::MIN_POSITIVE, 0.5, 1.0] {
+            assert!(
+                AdaptiveLimitConfig::new()
+                    .with_ewma_alpha(alpha)
+                    .validate()
+                    .is_ok()
+            );
+        }
+        for fraction in [0.0, 0.5, 1.0] {
             assert!(
                 AdaptiveLimitConfig::new()
                     .with_max_rampup_fraction(fraction)
@@ -316,7 +298,7 @@ mod tests {
                     .is_ok()
             );
         }
-        for factor in [f64::MIN_POSITIVE, 1.0 - f64::EPSILON] {
+        for factor in [f64::MIN_POSITIVE, 0.5, 1.0 - f64::EPSILON] {
             assert!(
                 AdaptiveLimitConfig::new()
                     .with_error_decrease_factor(factor)
@@ -326,7 +308,7 @@ mod tests {
         }
         assert!(
             AdaptiveLimitConfig::new()
-                .with_adapt_batch_usize(1)
+                .with_adapt_batch_size(1)
                 .validate()
                 .is_ok()
         );
@@ -389,6 +371,18 @@ mod tests {
         );
         assert_eq!(
             AdaptiveLimitConfig::default()
+                .with_initial_limit(10_000)
+                .with_ewma_alpha(-1.0)
+                .build()
+                .unwrap_err(),
+            ConfigError::InitialLimitOutOfRange {
+                initial: 10_000,
+                min: 2,
+                max: 1024,
+            }
+        );
+        assert_eq!(
+            AdaptiveLimitConfig::default()
                 .with_ewma_alpha(-1.0)
                 .with_max_rampup_fraction(-1.0)
                 .build()
@@ -406,14 +400,14 @@ mod tests {
         assert_eq!(
             AdaptiveLimitConfig::default()
                 .with_error_decrease_factor(-1.0)
-                .with_adapt_batch_usize(0)
+                .with_adapt_batch_size(0)
                 .build()
                 .unwrap_err(),
             ConfigError::InvalidErrorDecreaseFactor(-1.0)
         );
         assert_eq!(
             AdaptiveLimitConfig::default()
-                .with_adapt_batch_usize(0)
+                .with_adapt_batch_size(0)
                 .with_min_rtt_window(Duration::ZERO)
                 .build()
                 .unwrap_err(),
@@ -493,7 +487,7 @@ mod tests {
     #[test]
     fn rejects_zero_batch_and_window() {
         let err = AdaptiveLimitConfig::default()
-            .with_adapt_batch_usize(0)
+            .with_adapt_batch_size(0)
             .build()
             .unwrap_err();
         assert_eq!(err, ConfigError::ZeroAdaptBatchSize);

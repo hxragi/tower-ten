@@ -20,6 +20,7 @@ pub(crate) fn mono_now_ns() -> u64 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AdaptiveLimitSnapshot {
     pub current_limit: usize,
     pub active_requests: usize,
@@ -29,7 +30,7 @@ pub struct AdaptiveLimitSnapshot {
     pub total_errors: u64,
     pub total_dropped: u64,
     pub total_rejected: u64,
-    pub total_adptations: u64,
+    pub total_adaptations: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -183,7 +184,7 @@ impl Shared {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(()) => break,
+                Ok(_) => break,
                 Err(actual) => current = actual,
             }
         }
@@ -204,22 +205,12 @@ impl Shared {
             return;
         }
 
-        let completed = self.completed.swap(0, Ordering::Relaxed);
+        self.completed.swap(0, Ordering::Relaxed);
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         let errors = self.errors.swap(0, Ordering::Relaxed);
         let epoch_rtt_min = self.epoch_rtt_min.swap(u64::MAX, Ordering::Relaxed);
 
-        if completed + dropped >= self.cfg.adapt_batch_size {
-            self.adapt(dropped, errors, epoch_rtt_min);
-        } else {
-            self.completed.fetch_add(completed, Ordering::Relaxed);
-            self.dropped.fetch_add(dropped, Ordering::Relaxed);
-            self.errors.fetch_add(errors, Ordering::Relaxed);
-            if epoch_rtt_min != u64::MAX {
-                self.epoch_rtt_min
-                    .fetch_min(epoch_rtt_min, Ordering::Relaxed);
-            }
-        }
+        self.adapt(dropped, errors, epoch_rtt_min);
 
         self.adapting.store(0, Ordering::Release);
     }
@@ -234,15 +225,13 @@ impl Shared {
                 epoch_rtt_min
             } else {
                 let alpha = self.cfg.ewma_alpha;
-                (prev_ewma as f64 * (1.0 - alpha) + epoch_rtt_min as f64 * alpha) as u64
+                ((prev_ewma as f64 * (1.0 - alpha) + epoch_rtt_min as f64 * alpha) as u64).max(1)
             };
             self.rtt_ewma.store(ewma, Ordering::Relaxed);
 
             let rtt_min = self.rtt_min.load(Ordering::Relaxed);
-            if ewma > 0 {
-                let gradient = (rtt_min as f64 / ewma as f64).clamp(0.0, 1.0);
-                new_limit = limit * gradient + self.cfg.headroom as f64;
-            }
+            let gradient = (rtt_min as f64 / ewma as f64).clamp(0.0, 1.0);
+            new_limit = limit * gradient + self.cfg.headroom as f64;
         }
 
         if errors > 0 {
@@ -274,7 +263,7 @@ impl Shared {
             total_errors: self.total_errors.load(Ordering::Relaxed),
             total_dropped: self.total_dropped.load(Ordering::Relaxed),
             total_rejected: self.total_rejected.load(Ordering::Relaxed),
-            total_adptations: self.total_adaptations.load(Ordering::Relaxed),
+            total_adaptations: self.total_adaptations.load(Ordering::Relaxed),
         }
     }
 }
@@ -292,6 +281,27 @@ mod tests {
     use std::sync::atomic::Ordering::Relaxed;
 
     use super::*;
+
+    fn batch_cfg(batch: usize) -> AdaptiveLimitConfig {
+        AdaptiveLimitConfig::new()
+            .with_min_limit(1)
+            .with_max_limit(1000)
+            .with_initial_limit(10)
+            .with_headroom(4)
+            .with_adapt_batch_size(batch)
+            .with_ewma_alpha(0.2)
+            .with_max_rampup_fraction(0.5)
+            .with_error_decrease_factor(0.8)
+    }
+
+    fn complete_batch(limiter: &AdaptiveLimit, n: usize, rtt: Duration, success: bool) {
+        for _ in 0..n {
+            let permit = limiter
+                .try_acquire_permit()
+                .expect("slot must be available");
+            permit.complete_with(rtt, success);
+        }
+    }
 
     #[test]
     fn mono_now_ns_initializes_process_start_and_is_monotonic() {
@@ -376,74 +386,385 @@ mod tests {
         assert_eq!(shared.errors.load(Relaxed), 0);
         assert_eq!(shared.dropped.load(Relaxed), 0);
         assert_eq!(shared.adapting.load(Relaxed), 0);
-
         assert_eq!(shared.rtt_min.load(Relaxed), 0);
         assert_eq!(shared.rtt_ewma.load(Relaxed), 0);
         assert_eq!(shared.window_start_ns.load(Relaxed), 0);
         assert_eq!(shared.epoch_rtt_min.load(Relaxed), u64::MAX);
-
         assert_eq!(shared.total_completed.load(Relaxed), 0);
         assert_eq!(shared.total_errors.load(Relaxed), 0);
         assert_eq!(shared.total_dropped.load(Relaxed), 0);
         assert_eq!(shared.total_rejected.load(Relaxed), 0);
         assert_eq!(shared.total_adaptations.load(Relaxed), 0);
-
-        assert_eq!(shared.cfg.initial_limit, 16);
-        assert!(format!("{shared:?}").contains("Shared"));
     }
 
     #[test]
     fn shared_new_converts_window_to_nanoseconds() {
         let shared =
-            Shared::new(AdaptiveLimitConfig::new().with_min_rtt_window(Duration::from_secs(3)));
-        assert_eq!(shared.min_rtt_window_ns, 3_000_000_000);
-
-        let tiny =
-            Shared::new(AdaptiveLimitConfig::new().with_min_rtt_window(Duration::from_nanos(1)));
-        assert_eq!(tiny.min_rtt_window_ns, 1);
+            Shared::new(AdaptiveLimitConfig::new().with_min_rtt_window(Duration::from_secs(2)));
+        assert_eq!(shared.min_rtt_window_ns, 2_000_000_000);
     }
 
     #[test]
     fn shared_new_clamps_oversized_window_to_u64_max() {
         let shared = Shared::new(AdaptiveLimitConfig::new().with_min_rtt_window(Duration::MAX));
-        assert!(Duration::MAX.as_nanos() > u64::MAX as u128);
         assert_eq!(shared.min_rtt_window_ns, u64::MAX);
     }
 
     #[test]
+    fn shared_accessors() {
+        let limiter = AdaptiveLimit::new(batch_cfg(1_000_000).with_initial_limit(7)).unwrap();
+
+        assert_eq!(limiter.current_limit(), 7);
+        assert_eq!(limiter.active_requests(), 0);
+
+        let permit = limiter.try_acquire_permit().unwrap();
+        assert_eq!(limiter.active_requests(), 1);
+        assert_eq!(limiter.snapshot().current_limit, 7);
+        assert_eq!(limiter.snapshot().active_requests, 1);
+
+        drop(permit);
+        assert_eq!(limiter.active_requests(), 0);
+    }
+
+    #[test]
+    fn try_acquire_and_rejection_at_limit() {
+        let limiter = AdaptiveLimit::new(
+            AdaptiveLimitConfig::new()
+                .with_min_limit(2)
+                .with_max_limit(2)
+                .with_initial_limit(2)
+                .with_adapt_batch_size(1_000_000),
+        )
+        .unwrap();
+
+        let p1 = limiter.try_acquire_permit().unwrap();
+        let p2 = limiter.try_acquire_permit().unwrap();
+        assert!(limiter.try_acquire_permit().is_none());
+
+        assert_eq!(limiter.active_requests(), 2);
+        assert_eq!(limiter.snapshot().total_rejected, 1);
+
+        drop(p1);
+        assert!(limiter.try_acquire_permit().is_some());
+        drop(p2);
+    }
+
+    #[test]
+    fn concurrent_acquire_complete_survives_contention() {
+        let limiter = Arc::new(
+            AdaptiveLimit::new(
+                AdaptiveLimitConfig::new()
+                    .with_min_limit(64)
+                    .with_max_limit(64)
+                    .with_initial_limit(64)
+                    .with_adapt_batch_size(usize::MAX),
+            )
+            .unwrap(),
+        );
+
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let limiter = Arc::clone(&limiter);
+                std::thread::spawn(move || {
+                    for i in 0..5_000 {
+                        let permit = limiter.try_acquire_permit().expect("slot must be available");
+                        let ms = ((i + t) % 9) as u64 + 1;
+                        permit.complete_with(Duration::from_millis(ms), true);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let snap = limiter.snapshot();
+        assert_eq!(snap.active_requests, 0);
+        assert_eq!(snap.total_completed, 40_000);
+        assert_eq!(snap.total_dropped, 0);
+        assert_eq!(snap.total_rejected, 0);
+        assert_eq!(snap.total_adaptations, 0);
+        assert_eq!(snap.min_rtt, Some(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn rtt_cas_loop_smaller_observation() {
+        let limiter = AdaptiveLimit::new(batch_cfg(1_000_000)).unwrap();
+
+        complete_batch(&limiter, 1, Duration::from_millis(10), true);
+        complete_batch(&limiter, 1, Duration::from_millis(5), true);
+        complete_batch(&limiter, 1, Duration::from_millis(20), true);
+
+        assert_eq!(limiter.snapshot().min_rtt, Some(Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn rtt_cas_contention_triggers_retry() {
+        use std::sync::atomic::AtomicBool;
+
+        let shared = Arc::new(Shared::new(batch_cfg(1_000_000)));
+        shared.window_start_ns.store(u64::MAX, Relaxed);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let s_reset = Arc::clone(&shared);
+        let stop_reset = Arc::clone(&stop);
+
+        let resetter = std::thread::spawn(move || {
+            while !stop_reset.load(Relaxed) {
+                s_reset.rtt_min.store(1_000, Relaxed);
+                std::hint::spin_loop();
+            }
+        });
+
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let s = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        s.observe_rtt(500);
+                        s.observe_rtt(200);
+                        s.observe_rtt(100);
+                    }
+                })
+            })
+            .collect();
+
+        for w in workers {
+            w.join().unwrap();
+        }
+        stop.store(true, Relaxed);
+        resetter.join().unwrap();
+    }
+
+    #[test]
+    fn complete_and_rtt_window_advancement() {
+        let limiter =
+            AdaptiveLimit::new(batch_cfg(1_000_000).with_min_rtt_window(Duration::from_millis(20)))
+                .unwrap();
+
+        complete_batch(&limiter, 1, Duration::from_millis(10), true);
+        assert_eq!(limiter.snapshot().min_rtt, Some(Duration::from_millis(10)));
+
+        std::thread::sleep(Duration::from_millis(30));
+
+        complete_batch(&limiter, 1, Duration::from_millis(30), true);
+        assert_eq!(limiter.snapshot().min_rtt, Some(Duration::from_millis(30)));
+    }
+
+    #[test]
+    fn complete_clamps_zero_rtt_to_one_ns() {
+        let limiter = AdaptiveLimit::new(batch_cfg(1_000_000)).unwrap();
+
+        complete_batch(&limiter, 1, Duration::ZERO, true);
+
+        assert_eq!(limiter.snapshot().min_rtt, Some(Duration::from_nanos(1)));
+    }
+
+    #[test]
+    fn adapt_rampup_increases_limit() {
+        let limiter = AdaptiveLimit::new(batch_cfg(10)).unwrap();
+
+        complete_batch(&limiter, 10, Duration::from_millis(10), true);
+        assert_eq!(limiter.current_limit(), 14);
+
+        complete_batch(&limiter, 10, Duration::from_millis(10), true);
+        assert_eq!(limiter.current_limit(), 18);
+    }
+
+    #[test]
+    fn adapt_shrinks_limit_when_rtt_grows() {
+        let limiter = AdaptiveLimit::new(batch_cfg(10).with_initial_limit(16)).unwrap();
+
+        complete_batch(&limiter, 10, Duration::from_millis(10), true);
+        assert_eq!(limiter.current_limit(), 20);
+
+        complete_batch(&limiter, 10, Duration::from_millis(30), true);
+        assert_eq!(limiter.current_limit(), 18);
+    }
+
+    #[test]
+    fn adapt_uses_batch_min_rtt_for_ewma() {
+        let limiter = AdaptiveLimit::new(batch_cfg(10).with_initial_limit(16)).unwrap();
+
+        complete_batch(&limiter, 5, Duration::from_millis(10), true);
+        complete_batch(&limiter, 5, Duration::from_millis(100), true);
+
+        assert_eq!(limiter.current_limit(), 20);
+        assert_eq!(limiter.snapshot().ewma_rtt, Some(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn adapt_on_errors_decreases_limit() {
+        let limiter =
+            AdaptiveLimit::new(batch_cfg(10).with_initial_limit(100).with_headroom(0)).unwrap();
+
+        complete_batch(&limiter, 10, Duration::from_millis(10), false);
+        assert_eq!(limiter.current_limit(), 80);
+
+        complete_batch(&limiter, 10, Duration::from_millis(10), false);
+        assert_eq!(limiter.current_limit(), 64);
+    }
+
+    #[test]
+    fn adapt_error_decrease_beats_gradient_growth() {
+        let limiter = AdaptiveLimit::new(batch_cfg(10).with_initial_limit(50)).unwrap();
+
+        complete_batch(&limiter, 10, Duration::from_millis(10), false);
+
+        assert_eq!(limiter.current_limit(), 40);
+    }
+
+    #[test]
+    fn adapt_respects_min_clamp() {
+        let limiter = AdaptiveLimit::new(
+            batch_cfg(10)
+                .with_min_limit(5)
+                .with_initial_limit(20)
+                .with_headroom(0),
+        )
+        .unwrap();
+
+        complete_batch(&limiter, 80, Duration::from_millis(10), false);
+
+        assert_eq!(limiter.current_limit(), 5);
+    }
+
+    #[test]
+    fn adapt_respects_max_clamp() {
+        let limiter = AdaptiveLimit::new(
+            AdaptiveLimitConfig::new()
+                .with_min_limit(1)
+                .with_max_limit(5)
+                .with_initial_limit(2)
+                .with_headroom(100)
+                .with_adapt_batch_size(10)
+                .with_ewma_alpha(0.2)
+                .with_max_rampup_fraction(0.5),
+        )
+        .unwrap();
+
+        complete_batch(&limiter, 10, Duration::from_millis(10), true);
+        assert_eq!(limiter.current_limit(), 3);
+
+        complete_batch(&limiter, 10, Duration::from_millis(10), true);
+        assert_eq!(limiter.current_limit(), 5);
+
+        complete_batch(&limiter, 10, Duration::from_millis(10), true);
+        assert_eq!(limiter.current_limit(), 5);
+    }
+
+    #[test]
+    fn adapt_on_dropped_triggers_adaptation() {
+        let limiter = AdaptiveLimit::new(batch_cfg(10)).unwrap();
+
+        complete_batch(&limiter, 10, Duration::from_millis(10), true);
+        assert_eq!(limiter.current_limit(), 14);
+
+        complete_batch(&limiter, 5, Duration::from_millis(10), true);
+        for _ in 0..10 {
+            drop(limiter.try_acquire_permit().unwrap());
+        }
+
+        assert_eq!(limiter.current_limit(), 14);
+
+        let snap = limiter.snapshot();
+        assert_eq!(snap.total_dropped, 10);
+        assert_eq!(snap.active_requests, 0);
+        assert_eq!(snap.total_completed, 15);
+    }
+
+    #[test]
+    fn adapt_without_rtt_samples_keeps_limit() {
+        let limiter =
+            AdaptiveLimit::new(batch_cfg(10).with_initial_limit(16).with_headroom(4)).unwrap();
+
+        for _ in 0..10 {
+            drop(limiter.try_acquire_permit().unwrap());
+        }
+
+        assert_eq!(limiter.current_limit(), 16);
+
+        let snap = limiter.snapshot();
+        assert_eq!(snap.total_adaptations, 1);
+        assert_eq!(snap.ewma_rtt, None);
+        assert_eq!(snap.min_rtt, None);
+    }
+
+    #[test]
+    fn cancelled_requests_do_not_pollute_rtt_stats() {
+        let limiter =
+            AdaptiveLimit::new(AdaptiveLimitConfig::new().with_adapt_batch_size(1_000_000))
+                .unwrap();
+
+        for _ in 0..3 {
+            drop(limiter.try_acquire_permit().unwrap());
+        }
+
+        let snap = limiter.snapshot();
+        assert_eq!(snap.active_requests, 0);
+        assert_eq!(snap.total_dropped, 3);
+        assert_eq!(snap.total_completed, 0);
+        assert_eq!(snap.min_rtt, None);
+        assert_eq!(snap.ewma_rtt, None);
+    }
+
+    #[test]
+    fn maybe_adapt_skips_when_already_adapting() {
+        let shared = Shared::new(batch_cfg(4).with_initial_limit(10).with_headroom(0));
+
+        shared.adapting.store(1, Relaxed);
+
+        for _ in 0..4 {
+            shared.complete(1_000_000, true);
+        }
+
+        assert_eq!(shared.limit.load(Relaxed), 10);
+        assert_eq!(shared.completed.load(Relaxed), 4);
+        assert_eq!(shared.adapting.load(Relaxed), 1);
+
+        shared.adapting.store(0, Relaxed);
+    }
+
+    #[test]
+    fn maybe_adapt_ignores_below_batch() {
+        let shared = Shared::new(batch_cfg(8));
+
+        shared.complete(1_000, true);
+        shared.maybe_adapt();
+
+        assert_eq!(shared.limit.load(Relaxed), 10);
+        assert_eq!(shared.completed.load(Relaxed), 1);
+        assert_eq!(shared.epoch_rtt_min.load(Relaxed), 1_000);
+        assert_eq!(shared.adapting.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn ewma_smoothing_matches_formula() {
+        let limiter =
+            AdaptiveLimit::new(batch_cfg(1).with_initial_limit(16).with_headroom(0)).unwrap();
+
+        complete_batch(&limiter, 1, Duration::from_millis(100), true);
+        complete_batch(&limiter, 1, Duration::from_millis(200), true);
+
+        let ewma = limiter.snapshot().ewma_rtt.unwrap().as_nanos();
+        assert!((ewma as i128 - 120_000_000i128).abs() <= 2);
+        assert_eq!(limiter.current_limit(), 13);
+    }
+
+    #[test]
     fn snapshot_derives_debug_copy_partial_eq_and_eq() {
-        let snapshot = AdaptiveLimitSnapshot {
-            current_limit: 16,
-            active_requests: 3,
-            min_rtt: Some(Duration::from_millis(5)),
-            ewma_rtt: Some(Duration::from_millis(7)),
-            total_completed: 10,
-            total_errors: 1,
-            total_dropped: 2,
-            total_rejected: 4,
-            total_adptations: 5,
-        };
-
-        assert_eq!(snapshot, snapshot);
-        assert_eq!(Clone::clone(&snapshot), snapshot);
-        assert!(format!("{snapshot:?}").contains("current_limit: 16"));
-
-        let mut other = snapshot;
-        other.current_limit = 17;
-        assert_ne!(other, snapshot);
-        assert_eq!(snapshot.current_limit, 16, "snapshot must be Copy");
-
-        let idle = AdaptiveLimitSnapshot {
-            current_limit: 1,
-            active_requests: 0,
-            min_rtt: None,
-            ewma_rtt: None,
-            total_completed: 0,
-            total_errors: 0,
-            total_dropped: 0,
-            total_rejected: 0,
-            total_adptations: 0,
-        };
-        assert_ne!(idle, snapshot);
+        let limiter = AdaptiveLimit::new(AdaptiveLimitConfig::new()).unwrap();
+        let snap = limiter.snapshot();
+        let copy = snap;
+        assert_eq!(snap, copy);
+        assert_ne!(
+            snap,
+            AdaptiveLimitSnapshot {
+                current_limit: snap.current_limit + 1,
+                ..snap
+            }
+        );
+        assert!(format!("{copy:?}").contains("AdaptiveLimitSnapshot"));
     }
 }

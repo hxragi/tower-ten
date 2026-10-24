@@ -2,19 +2,15 @@ use std::{error, fmt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdaptiveLimitError<E> {
-    // Limit concurrency exceeded - request rejected without waiting
     LimitExceeded,
-    // Inner service returned error
     Inner(E),
 }
 
 impl<E> AdaptiveLimitError<E> {
-    // 'true' if request rejected by limiter
     pub fn is_limit_exceeded(&self) -> bool {
         matches!(self, Self::LimitExceeded)
     }
 
-    // returned internal error, if it not `LimitExceeded`
     pub fn into_inner(self) -> Option<E> {
         match self {
             Self::Inner(err) => Some(err),
