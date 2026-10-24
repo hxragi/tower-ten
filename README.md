@@ -48,17 +48,21 @@ The codebase is organized into modular components:
 
 Tower Ten computes a concurrency limit dynamically using an RTT gradient:
 
-1. **Baseline Tracking**: Maintains the minimum observed RTT ($\text{RTT}_{\min}$) over a rolling window (`min_rtt_window`).
-2. **Smoothed Latency**: Computes an exponentially weighted moving average ($\text{RTT}_{\text{EWMA}}$) across completed batches.
+1. **Baseline Tracking**: Maintains the minimum observed RTT (`min_rtt`) over a rolling window (`min_rtt_window`).
+2. **Smoothed Latency**: Computes an exponentially weighted moving average (`ewma_rtt`) across completed batches.
 3. **Gradient Calculation**:
-   $$\text{gradient} = \text{clamp}\left(\frac{\text{RTT}_{\min}}{\text{RTT}_{\text{EWMA}}}, 0.0, 1.0\right)$$
+   ```text
+   gradient = clamp(min_rtt / ewma_rtt, 0.0, 1.0)
+   ```
 4. **Limit Adjustment**:
-   $$\text{new\_limit} = \text{limit} \times \text{gradient} + \text{headroom}$$
-   - When latency stays low ($\text{gradient} \approx 1.0$), the limit grows by `headroom` up to `max_rampup_fraction`.
-   - When latency climbs ($\text{gradient} < 1.0$), the limit contracts proportionally.
+   ```text
+   new_limit = limit * gradient + headroom
+   ```
+   - When latency stays low (`gradient ≈ 1.0`), the limit grows by `headroom` up to `max_rampup_fraction`.
+   - When latency climbs (`gradient < 1.0`), the limit contracts proportionally.
    - If errors occur during the epoch, a multiplicative penalty (`error_decrease_factor`) is applied.
    - If requests were dropped or cancelled, limit increases are suppressed.
-   - The result is clamped to $[\text{min\_limit}, \text{max\_limit}]$.
+   - The result is clamped to `[min_limit, max_limit]`.
 
 ## Tech stack
 
@@ -145,10 +149,10 @@ let layer = AdaptiveLimitLayer::new(limiter).with_classifier(classify_http_5xx);
 | `initial_limit` | `16` | Starting limit on initialization |
 | `headroom` | `4` | Additive capacity added to the gradient to probe for bandwidth |
 | `min_rtt_window` | `10m` | Sliding window duration to reset and measure minimum baseline RTT |
-| `ewma_alpha` | `0.2` | Smoothing factor $\alpha$ for RTT EWMA ($0 < \alpha \le 1.0$) |
+| `ewma_alpha` | `0.2` | Smoothing factor α for RTT EWMA (0 < α <= 1.0) |
 | `adapt_batch_size` | `32` | Number of completed or dropped requests before adjusting the limit |
 | `max_rampup_fraction` | `0.25` | Maximum percentage increase allowed in a single adaptation step |
-| `error_decrease_factor` | `0.8` | Multiplier applied to shrink the limit when errors occur ($0 < factor < 1.0$) |
+| `error_decrease_factor` | `0.8` | Multiplier applied to shrink the limit when errors occur (0 < factor < 1.0) |
 
 ## Run checks locally
 
